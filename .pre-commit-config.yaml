@@ -53,4 +53,17 @@ repos:
         pass_filenames: false
         stages: [manual]
 
+      - id: icechunk-js-typecheck
+        name: "icechunk-js TypeScript check"
+        entry: bash -c 'cd icechunk-js && npm run typecheck'
+        language: system
+        files: ^icechunk-js/.*\.(ts|tsx)$
+        pass_filenames: false
+
+      - id: icechunk-js-format
+        name: "icechunk-js Prettier format"
+        entry: bash -c 'cd icechunk-js && npx prettier --write --ignore-unknown'
+        language: system
+        files: ^icechunk-js/.*\.(ts|tsx|js|json|md)$
+
 exclude: 'tests/data/.*'
