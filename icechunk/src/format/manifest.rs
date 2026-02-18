@@ -1,3 +1,5 @@
+//! Chunk reference tables mapping coordinates to storage locations.
+
 use std::{
     borrow::Cow,
     cmp::{max, min},
@@ -371,16 +373,14 @@ impl Manifest {
         Ok(Manifest { buffer })
     }
 
-    pub async fn from_stream<E>(
-        stream: impl Stream<Item = Result<ChunkInfo, E>>,
-    ) -> Result<Option<Self>, E> {
+    pub fn from_sorted_vec(
+        manifest_id: &ManifestId,
+        sorted_chunks: Vec<ChunkInfo>,
+    ) -> Option<Self> {
         // TODO: what's a good capacity?
         let mut builder = flatbuffers::FlatBufferBuilder::with_capacity(1024 * 1024);
-        let mut all = stream.try_collect::<Vec<_>>().await?;
-        // FIXME: should we sort here or can we sort outside?
-        all.sort_by(|a, b| (&a.node, &a.coord).cmp(&(&b.node, &b.coord)));
 
-        let mut all = all.iter().peekable();
+        let mut all = sorted_chunks.iter().peekable();
 
         let mut array_manifests = Vec::with_capacity(1);
         while let Some(current_node) = all.peek().map(|chunk| &chunk.node).cloned() {
@@ -401,11 +401,10 @@ impl Manifest {
 
         if array_manifests.is_empty() {
             // empty manifest
-            return Ok(None);
+            return None;
         }
 
         let arrays = builder.create_vector(array_manifests.as_slice());
-        let manifest_id = ManifestId::random();
         let bin_manifest_id = generated::ObjectId12::new(&manifest_id.0);
 
         let manifest = generated::Manifest::create(
@@ -417,14 +416,25 @@ impl Manifest {
         let (mut buffer, offset) = builder.collapse();
         buffer.drain(0..offset);
         buffer.shrink_to_fit();
-        Ok(Some(Manifest { buffer }))
+        Some(Manifest { buffer })
+    }
+
+    pub async fn from_stream<E>(
+        manifest_id: &ManifestId,
+        stream: impl Stream<Item = Result<ChunkInfo, E>>,
+    ) -> Result<Option<Self>, E> {
+        let mut all = stream.try_collect::<Vec<_>>().await?;
+        all.sort_by(|a, b| (&a.node, &a.coord).cmp(&(&b.node, &b.coord)));
+        Ok(Self::from_sorted_vec(manifest_id, all))
     }
 
     /// Used for tests
     pub async fn from_iter<T: IntoIterator<Item = ChunkInfo>>(
+        manifest_id: &ManifestId,
         iter: T,
     ) -> Result<Option<Self>, Infallible> {
-        Self::from_stream(futures::stream::iter(iter.into_iter().map(Ok))).await
+        Self::from_stream(manifest_id, futures::stream::iter(iter.into_iter().map(Ok)))
+            .await
     }
 
     pub fn len(&self) -> usize {
@@ -440,6 +450,10 @@ impl Manifest {
         // without the unsafe version this is too slow
         // if we try to keep the root in the Manifest struct, we would need a lifetime
         unsafe { flatbuffers::root_unchecked::<generated::Manifest>(&self.buffer) }
+    }
+
+    pub fn arrays(&self) -> impl Iterator<Item = NodeId> {
+        self.root().arrays().iter().map(|am| NodeId::from(am.node_id().0))
     }
 
     pub fn get_chunk_payload(

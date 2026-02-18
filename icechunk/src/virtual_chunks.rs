@@ -1,3 +1,9 @@
+//! References to external data sources.
+//!
+//! Virtual chunks allow arrays to reference data stored outside the Icechunk
+//! repository (e.g., existing Parquet, NetCDF, or other files). Instead of
+//! copying data, chunks store references to byte ranges in external files.
+
 use std::{
     collections::HashMap,
     num::{NonZeroU16, NonZeroU64},
@@ -35,12 +41,13 @@ use crate::{
             ObjectStoreBackend as _,
         },
         s3::{mk_client, range_to_header},
-        split_in_multiple_requests,
+        split_in_multiple_requests, strip_quotes,
     },
 };
 
 pub type ContainerName = String;
 
+/// Configuration for an external data source that virtual chunks can reference.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct VirtualChunkContainer {
     // name is no longer needed, but we keep it for compatibility with
@@ -173,6 +180,7 @@ impl VirtualChunkContainer {
     }
 }
 
+/// Trait for fetching byte ranges from external data sources.
 #[async_trait]
 pub trait ChunkFetcher: std::fmt::Debug + private::Sealed + Send + Sync {
     fn ideal_concurrent_request_size(&self) -> NonZeroU64;
@@ -238,6 +246,7 @@ type CacheKey = (ContainerName, Option<BucketName>);
 
 type ChunkFetcherCache = Cache<CacheKey, Arc<dyn ChunkFetcher>>;
 
+/// Resolves virtual chunk references to actual bytes from external sources.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct VirtualChunkResolver {
     containers: Vec<VirtualChunkContainer>,
@@ -589,7 +598,7 @@ impl ChunkFetcher for S3Fetcher {
                 ))
             }
             Some(Checksum::ETag(etag)) => {
-                b = b.if_match(&etag.0);
+                b = b.if_match(strip_quotes(&etag.0));
             }
             None => {}
         };
@@ -767,7 +776,9 @@ impl ChunkFetcher for ObjectStoreFetcher {
                     .expect("Bad last modified field in virtual chunk reference");
                 options.if_unmodified_since = Some(d);
             }
-            Some(Checksum::ETag(etag)) => options.if_match = Some(etag.0.clone()),
+            Some(Checksum::ETag(etag)) => {
+                options.if_match = Some(strip_quotes(&etag.0).to_string())
+            }
             None => {}
         }
 

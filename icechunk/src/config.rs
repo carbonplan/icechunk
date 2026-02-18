@@ -1,6 +1,16 @@
+//! Configuration types for repositories and storage.
+//!
+//! Key types:
+//! - [`RepositoryConfig`] - Main configuration for a repository
+//! - [`ObjectStoreConfig`] - Storage backend selection (S3, GCS, Azure, local, etc.)
+//! - [`S3Credentials`], [`GcsCredentials`], [`AzureCredentials`] - Cloud authentication
+//! - [`CachingConfig`] - Cache size limits
+//! - [`ManifestSplittingConfig`] - Controls how manifests are partitioned
+
 use core::fmt;
 use std::{
     collections::HashMap,
+    num::NonZeroU16,
     ops::Bound,
     path::PathBuf,
     sync::{Arc, OnceLock},
@@ -13,7 +23,11 @@ pub use object_store::gcp::GcpCredential;
 use regex::bytes::Regex;
 use serde::{Deserialize, Serialize};
 
-use crate::{format::Path, storage, virtual_chunks::VirtualChunkContainer};
+use crate::{
+    format::Path,
+    storage::{self, RetriesSettings},
+    virtual_chunks::VirtualChunkContainer,
+};
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct S3Options {
@@ -51,6 +65,7 @@ impl fmt::Display for S3Options {
     }
 }
 
+/// Storage backend configuration.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ObjectStoreConfig {
@@ -98,6 +113,7 @@ impl CompressionConfig {
     }
 }
 
+/// Cache size configuration for in-memory caches.
 #[derive(Debug, PartialEq, Eq, Serialize, Deserialize, Clone, Default)]
 pub struct CachingConfig {
     #[serde(default)]
@@ -374,6 +390,42 @@ impl ManifestConfig {
     }
 }
 
+/// Retry configuration for repo info update operations.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct RepoUpdateRetryConfig {
+    /// Default retry settings for all repo update operations.
+    #[serde(default)]
+    pub default: Option<RetriesSettings>,
+}
+
+static DEFAULT_REPO_UPDATE_RETRIES: OnceLock<RetriesSettings> = OnceLock::new();
+
+impl RepoUpdateRetryConfig {
+    fn default_retries() -> &'static RetriesSettings {
+        DEFAULT_REPO_UPDATE_RETRIES.get_or_init(|| RetriesSettings {
+            max_tries: Some(NonZeroU16::new(100).unwrap_or(NonZeroU16::MIN)),
+            initial_backoff_ms: Some(50),
+            max_backoff_ms: Some(30_000),
+        })
+    }
+
+    pub fn retries(&self) -> &RetriesSettings {
+        self.default.as_ref().unwrap_or(Self::default_retries())
+    }
+
+    pub fn merge(&self, other: Self) -> Self {
+        Self {
+            default: match (&self.default, other.default) {
+                (None, None) => None,
+                (None, Some(c)) => Some(c),
+                (Some(c), None) => Some(c.clone()),
+                (Some(mine), Some(theirs)) => Some(mine.merge(theirs)),
+            },
+        }
+    }
+}
+
+/// Configuration options for a repository.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct RepositoryConfig {
     /// Chunks smaller than this will be stored inline in the manifest
@@ -409,11 +461,16 @@ pub struct RepositoryConfig {
 
     #[serde(default)]
     pub previous_file: Option<String>,
+
+    #[serde(default)]
+    pub repo_update_retries: Option<RepoUpdateRetryConfig>,
 }
 
 static DEFAULT_COMPRESSION: OnceLock<CompressionConfig> = OnceLock::new();
 static DEFAULT_CACHING: OnceLock<CachingConfig> = OnceLock::new();
 static DEFAULT_MANIFEST_CONFIG: OnceLock<ManifestConfig> = OnceLock::new();
+static DEFAULT_REPO_UPDATE_RETRY_CONFIG: OnceLock<RepoUpdateRetryConfig> =
+    OnceLock::new();
 pub const DEFAULT_MAX_CONCURRENT_REQUESTS: u16 = 256;
 
 impl RepositoryConfig {
@@ -446,6 +503,12 @@ impl RepositoryConfig {
 
     pub fn max_concurrent_requests(&self) -> u16 {
         self.max_concurrent_requests.unwrap_or(DEFAULT_MAX_CONCURRENT_REQUESTS)
+    }
+
+    pub fn repo_update_retries(&self) -> &RepoUpdateRetryConfig {
+        self.repo_update_retries.as_ref().unwrap_or_else(|| {
+            DEFAULT_REPO_UPDATE_RETRY_CONFIG.get_or_init(RepoUpdateRetryConfig::default)
+        })
     }
 
     pub fn merge(&self, other: Self) -> Self {
@@ -483,6 +546,8 @@ impl RepositoryConfig {
                 (Some(s), None) => Some(s.clone()),
                 (Some(mine), Some(theirs)) => Some(mine.merge(theirs)),
             },
+            // For virtual_chunk_containers, replace rather than extend.
+            // This is consistent with other fields: if specified, it replaces.
             virtual_chunk_containers: match (
                 &self.virtual_chunk_containers,
                 other.virtual_chunk_containers,
@@ -490,11 +555,7 @@ impl RepositoryConfig {
                 (None, None) => None,
                 (None, Some(c)) => Some(c),
                 (Some(c), None) => Some(c.clone()),
-                (Some(mine), Some(theirs)) => {
-                    let mut merged = mine.clone();
-                    merged.extend(theirs);
-                    Some(merged)
-                }
+                (Some(_), Some(theirs)) => Some(theirs),
             },
             manifest: match (&self.manifest, other.manifest) {
                 (None, None) => None,
@@ -507,6 +568,15 @@ impl RepositoryConfig {
                 (None, Some(c)) => Some(c),
                 (Some(c), None) => Some(c.clone()),
                 (Some(_), Some(theirs)) => Some(theirs),
+            },
+            repo_update_retries: match (
+                &self.repo_update_retries,
+                other.repo_update_retries,
+            ) {
+                (None, None) => None,
+                (None, Some(c)) => Some(c),
+                (Some(c), None) => Some(c.clone()),
+                (Some(mine), Some(theirs)) => Some(mine.merge(theirs)),
             },
         }
     }
@@ -554,6 +624,7 @@ pub trait S3CredentialsFetcher: fmt::Debug + Sync + Send {
     async fn get(&self) -> Result<S3StaticCredentials, String>;
 }
 
+/// S3 authentication credentials.
 #[derive(Clone, Debug, Deserialize, Serialize, Default)]
 #[serde(tag = "s3_credential_type")]
 #[serde(rename_all = "snake_case")]
@@ -594,6 +665,7 @@ pub trait GcsCredentialsFetcher: fmt::Debug + Sync + Send {
     async fn get(&self) -> Result<GcsBearerCredential, String>;
 }
 
+/// Google Cloud Storage authentication credentials.
 #[derive(Clone, Debug, Deserialize, Serialize, Default)]
 #[serde(tag = "gcs_credential_type")]
 #[serde(rename_all = "snake_case")]
@@ -615,6 +687,7 @@ pub enum AzureStaticCredentials {
     BearerToken(String),
 }
 
+/// Azure Blob Storage authentication credentials.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(tag = "az_credential_type")]
 #[serde(rename_all = "snake_case")]
@@ -657,9 +730,14 @@ macro_rules! roundtrip_serialization_tests {
 #[cfg(test)]
 #[allow(clippy::panic, clippy::unwrap_used, clippy::expect_used)]
 mod tests {
-    use crate::strategies::{
-        azure_credentials, gcs_static_credentials, repository_config,
-        s3_static_credentials,
+    use crate::{
+        ObjectStoreConfig, RepositoryConfig,
+        config::S3Options,
+        strategies::{
+            azure_credentials, gcs_static_credentials, repository_config,
+            s3_static_credentials,
+        },
+        virtual_chunks::VirtualChunkContainer,
     };
 
     use proptest::prelude::*;
@@ -670,4 +748,89 @@ mod tests {
         test_gcs_static_credentials_roundtrip - gcs_static_credentials,
         test_azure_credentials_roundtrip - azure_credentials
     );
+
+    #[icechunk_macros::test]
+    fn test_merge_replaces_virtual_chunk_containers() {
+        // Create a config with a VCC
+        let mut config1 = RepositoryConfig::default();
+        config1.set_virtual_chunk_container(
+            VirtualChunkContainer::new(
+                "s3://bucket1/".to_string(),
+                ObjectStoreConfig::S3(S3Options {
+                    region: Some("us-east-1".to_string()),
+                    endpoint_url: None,
+                    anonymous: false,
+                    allow_http: false,
+                    force_path_style: false,
+                    network_stream_timeout_seconds: None,
+                    requester_pays: false,
+                }),
+            )
+            .unwrap(),
+        );
+
+        // Create a config with no VCCs (cleared)
+        let mut config2 = RepositoryConfig::default();
+        config2.clear_virtual_chunk_containers();
+
+        // Merge: config2 (empty VCCs) should replace config1's VCCs
+        let merged = config1.merge(config2);
+
+        // VCCs should be empty after merge
+        assert_eq!(
+            merged.virtual_chunk_containers,
+            Some(std::collections::HashMap::new()),
+            "Merging with cleared VCCs should result in empty VCCs"
+        );
+    }
+
+    #[icechunk_macros::test]
+    fn test_merge_replaces_virtual_chunk_containers_with_new_ones() {
+        // Create a config with VCC1
+        let mut config1 = RepositoryConfig::default();
+        config1.set_virtual_chunk_container(
+            VirtualChunkContainer::new(
+                "s3://bucket1/".to_string(),
+                ObjectStoreConfig::S3(S3Options {
+                    region: Some("us-east-1".to_string()),
+                    endpoint_url: None,
+                    anonymous: false,
+                    allow_http: false,
+                    force_path_style: false,
+                    network_stream_timeout_seconds: None,
+                    requester_pays: false,
+                }),
+            )
+            .unwrap(),
+        );
+
+        // Create a config with VCC2
+        let mut config2 = RepositoryConfig::default();
+        config2.set_virtual_chunk_container(
+            VirtualChunkContainer::new(
+                "s3://bucket2/".to_string(),
+                ObjectStoreConfig::S3(S3Options {
+                    region: Some("us-west-2".to_string()),
+                    endpoint_url: None,
+                    anonymous: false,
+                    allow_http: false,
+                    force_path_style: false,
+                    network_stream_timeout_seconds: None,
+                    requester_pays: false,
+                }),
+            )
+            .unwrap(),
+        );
+
+        // Merge: config2's VCCs should replace config1's VCCs
+        let merged = config1.merge(config2);
+
+        let vccs = merged.virtual_chunk_containers.unwrap();
+        assert_eq!(vccs.len(), 1, "Should have exactly one VCC after merge");
+        assert!(
+            vccs.contains_key("s3://bucket2/"),
+            "Should contain bucket2, not bucket1"
+        );
+        assert!(!vccs.contains_key("s3://bucket1/"), "Should not contain bucket1");
+    }
 }

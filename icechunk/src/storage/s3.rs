@@ -1,6 +1,8 @@
+//! Native S3 client implementation of [`Storage`](super::Storage).
+
 use std::{
     collections::HashMap, fmt, future::ready, ops::Range, path::PathBuf, pin::Pin,
-    sync::Arc,
+    sync::Arc, time::Duration,
 };
 
 use crate::{
@@ -8,6 +10,7 @@ use crate::{
     config::{S3Credentials, S3CredentialsFetcher, S3Options},
     format::ChunkOffset,
     private,
+    storage::strip_quotes,
 };
 use async_trait::async_trait;
 use aws_config::{
@@ -29,6 +32,7 @@ use aws_sdk_s3::{
     primitives::ByteStream,
     types::{CompletedMultipartUpload, CompletedPart, Delete, Object, ObjectIdentifier},
 };
+use aws_smithy_runtime::client::retries::classifiers::HttpStatusCodeClassifier;
 use aws_smithy_types_convert::{date_time::DateTimeExt, stream::PaginationStreamExt};
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
@@ -145,8 +149,8 @@ pub async fn mk_client(
         StalledStreamProtectionConfig::disabled()
     } else {
         StalledStreamProtectionConfig::enabled()
-            .grace_period(std::time::Duration::from_secs(
-                config.network_stream_timeout_seconds.unwrap_or(60) as u64,
+            .grace_period(Duration::from_secs(
+                config.network_stream_timeout_seconds.unwrap_or(10) as u64,
             ))
             .build()
     };
@@ -173,11 +177,11 @@ pub async fn mk_client(
 
     let retry_config = RetryConfig::standard()
         .with_max_attempts(settings.retries().max_tries().get() as u32)
-        .with_initial_backoff(core::time::Duration::from_millis(
+        .with_initial_backoff(Duration::from_millis(
             settings.retries().initial_backoff_ms() as u64,
         ))
-        .with_max_backoff(core::time::Duration::from_millis(
-            settings.retries().max_backoff_ms() as u64,
+        .with_max_backoff(Duration::from_millis(
+            settings.retries().max_backoff_ms() as u64
         ));
 
     let mut s3_builder = Builder::from(&aws_config.load().await)
@@ -186,11 +190,23 @@ pub async fn mk_client(
 
     // credentials may take a while to refresh, defaults are too strict
     let id_cache = IdentityCache::lazy()
-        .load_timeout(core::time::Duration::from_secs(120))
-        .buffer_time(core::time::Duration::from_secs(120))
+        .load_timeout(Duration::from_secs(120))
+        .buffer_time(Duration::from_secs(120))
         .build();
 
     s3_builder = s3_builder.identity_cache(id_cache);
+
+    // Add retry classifier for HTTP 408 (Request Timeout)
+    // The default HttpStatusCodeClassifier only retries on 500, 502, 503, 504
+    static RETRY_CODES: &[u16] = &[408];
+    // This confusingly named `retry_classifier` method ends up calling
+    // `push_retry_classifier` after wrapping our custom classifier in `SharedRetryClassifier`.
+    // Ultimately, this is a push on to a `Vec<SharedRetryClassifier>`, and is thus additive
+    // to the existing default retry configuration.
+    // https://github.com/smithy-lang/smithy-rs/blob/cfcc39cf4b5bea665bba684b64bfca2b89e4bc73/rust-runtime/aws-smithy-runtime-api/src/client/runtime_components.rs#L755
+    // https://github.com/smithy-lang/smithy-rs/blob/cfcc39cf4b5bea665bba684b64bfca2b89e4bc73/rust-runtime/aws-smithy-runtime-api/src/client/runtime_components.rs#L370
+    s3_builder = s3_builder
+        .retry_classifier(HttpStatusCodeClassifier::new_from_codes(RETRY_CODES));
 
     if !extra_read_headers.is_empty() || !extra_write_headers.is_empty() {
         s3_builder = s3_builder.interceptor(ExtraHeadersInterceptor {
@@ -856,10 +872,6 @@ impl ProvideRefreshableCredentials {
         );
         Ok(creds)
     }
-}
-
-fn strip_quotes(s: &str) -> &str {
-    s.strip_prefix('"').and_then(|s| s.strip_suffix('"')).unwrap_or(s)
 }
 
 #[cfg(test)]

@@ -1,3 +1,5 @@
+//! Garbage collection to remove unreferenced data.
+
 use std::{
     collections::{HashMap, HashSet},
     future::ready,
@@ -14,6 +16,7 @@ use tracing::{debug, info, instrument};
 use crate::{
     StorageError,
     asset_manager::AssetManager,
+    config::RepoUpdateRetryConfig,
     format::{
         ChunkId, FileTypeTag, IcechunkFormatError, ManifestId, ObjectId, SnapshotId,
         format_constants::SpecVersionBin,
@@ -320,6 +323,7 @@ pub async fn find_retained(
 pub async fn garbage_collect(
     asset_manager: Arc<AssetManager>,
     config: &GCConfig,
+    repo_update_retries: Option<&RepoUpdateRetryConfig>,
 ) -> GCResult<GCSummary> {
     if !asset_manager.can_write_to_storage().await? {
         return Err(GCError::Repository(
@@ -377,10 +381,17 @@ pub async fn garbage_collect(
     // TODO: this could use more parallelization.
     // The trivial approach of parallelizing the deletes of the different types of objects doesn't
     // work: we want to dolete snapshots before deleting chunks, etc
+    let default_retry_config = RepoUpdateRetryConfig::default();
+    let retry_config = repo_update_retries.unwrap_or(&default_retry_config);
+
     if config.deletes_snapshots() {
         if !config.dry_run && repo_info.is_some() {
-            delete_snapshots_from_repo_info(asset_manager.as_ref(), &keep_snapshots)
-                .await?;
+            delete_snapshots_from_repo_info(
+                asset_manager.as_ref(),
+                &keep_snapshots,
+                retry_config.retries(),
+            )
+            .await?;
         }
         let res = gc_snapshots(asset_manager.as_ref(), config, &keep_snapshots).await?;
         summary.snapshots_deleted = res.deleted_objects;
@@ -410,6 +421,7 @@ pub async fn garbage_collect(
 async fn delete_snapshots_from_repo_info(
     asset_manager: &AssetManager,
     keep_snapshots: &HashSet<SnapshotId>,
+    retry_settings: &crate::storage::RetriesSettings,
 ) -> GCResult<()> {
     // FIXME: IMPORTANT
     // Notice this loses any new snapshots that may have been created while GC was running
@@ -439,10 +451,7 @@ async fn delete_snapshots_from_repo_info(
         Ok(Arc::new(new_repo_info))
     };
 
-    let _ = asset_manager
-        // FIXME: hardcoded retries
-        .update_repo_info(AssetManager::limit_retries_repo_update(100, do_update))
-        .await?;
+    let _ = asset_manager.update_repo_info(retry_settings, do_update).await?;
 
     Ok(())
 }
@@ -602,19 +611,20 @@ pub struct ExpireResult {
 /// For this reasons, it's recommended to invalidate any snapshot
 /// caches before traversing history againg. The cache in the
 /// passed `asset_manager` is invalidated here, but other caches
-/// may exist, for example, in [`Repository`] instances.
+/// may exist, for example, in [`crate::Repository`] instances.
 ///
 /// Notice that the snapshot returned as released, are not necessarily
 /// available for garbage collection, they could still be pointed by
 /// ether refs.
 ///
-/// See: https://github.com/earth-mover/icechunk/blob/main/design-docs/007-basic-expiration.md
+/// See: <https://github.com/earth-mover/icechunk/blob/main/design-docs/007-basic-expiration.md>
 #[instrument(skip(asset_manager))]
 pub async fn expire(
     asset_manager: Arc<AssetManager>,
     older_than: DateTime<Utc>,
     expired_branches: ExpiredRefAction,
     expired_tags: ExpiredRefAction,
+    repo_update_retries: Option<&RepoUpdateRetryConfig>,
 ) -> GCResult<ExpireResult> {
     match asset_manager.spec_version() {
         SpecVersionBin::V1dot0 => {
@@ -627,7 +637,14 @@ pub async fn expire(
             .await
         }
         SpecVersionBin::V2dot0 => {
-            expire_v2(asset_manager, older_than, expired_branches, expired_tags).await
+            expire_v2(
+                asset_manager,
+                older_than,
+                expired_branches,
+                expired_tags,
+                repo_update_retries,
+            )
+            .await
         }
     }
 }
@@ -638,6 +655,7 @@ pub async fn expire_v2(
     older_than: DateTime<Utc>,
     expired_branches: ExpiredRefAction,
     expired_tags: ExpiredRefAction,
+    repo_update_retries: Option<&RepoUpdateRetryConfig>,
 ) -> GCResult<ExpireResult> {
     if !asset_manager.can_write_to_storage().await? {
         return Err(GCError::Repository(
@@ -826,10 +844,9 @@ pub async fn expire_v2(
         Ok(Arc::new(new_repo_info))
     };
 
-    let _ = asset_manager
-        // FIXME: hardcoded retries
-        .update_repo_info(AssetManager::limit_retries_repo_update(100, do_update))
-        .await?;
+    let default_retry_config = RepoUpdateRetryConfig::default();
+    let retry_config = repo_update_retries.unwrap_or(&default_retry_config);
+    let _ = asset_manager.update_repo_info(retry_config.retries(), do_update).await?;
 
     deleted_tags.extend(deleted_branches);
 

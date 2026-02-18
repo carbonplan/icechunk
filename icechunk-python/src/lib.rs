@@ -15,9 +15,9 @@ use config::{
     PyCompressionAlgorithm, PyCompressionConfig, PyCredentials, PyGcsBearerCredential,
     PyGcsCredentials, PyGcsStaticCredentials, PyManifestConfig,
     PyManifestPreloadCondition, PyManifestPreloadConfig, PyObjectStoreConfig,
-    PyRepositoryConfig, PyS3Credentials, PyS3Options, PyS3StaticCredentials, PyStorage,
-    PyStorageConcurrencySettings, PyStorageRetriesSettings, PyStorageSettings,
-    PyVirtualChunkContainer,
+    PyRepoUpdateRetryConfig, PyRepositoryConfig, PyS3Credentials, PyS3Options,
+    PyS3StaticCredentials, PyStorage, PyStorageConcurrencySettings,
+    PyStorageRetriesSettings, PyStorageSettings, PyVirtualChunkContainer,
 };
 use config::{
     PyManifestSplitCondition, PyManifestSplitDimCondition, PyManifestSplittingConfig,
@@ -39,7 +39,7 @@ use repository::{
     PyRepoMigratedUpdate, PyRepository, PySnapshotInfo, PyTagCreatedUpdate,
     PyTagDeletedUpdate, PyUpdateType,
 };
-use session::{ChunkType, PySession};
+use session::{ChunkType, PySession, PySessionMode};
 use stats::PyChunkStorageStats;
 use store::{PyStore, VirtualChunkSpec};
 
@@ -167,6 +167,7 @@ fn _icechunk_python(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyRepositoryConfig>()?;
     m.add_class::<PySession>()?;
     m.add_class::<ChunkType>()?;
+    m.add_class::<PySessionMode>()?;
     m.add_class::<PyStore>()?;
     m.add_class::<PySnapshotInfo>()?;
     m.add_class::<PyManifestFileInfo>()?;
@@ -192,6 +193,7 @@ fn _icechunk_python(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyCachingConfig>()?;
     m.add_class::<PyStorageConcurrencySettings>()?;
     m.add_class::<PyStorageRetriesSettings>()?;
+    m.add_class::<PyRepoUpdateRetryConfig>()?;
     m.add_class::<PyManifestPreloadConfig>()?;
     m.add_class::<PyManifestPreloadCondition>()?;
     m.add_class::<PyManifestConfig>()?;
