@@ -87,7 +87,6 @@ jobs:
 
   schema-check:
     runs-on: ubuntu-latest
-    if: contains(github.event.pull_request.changed_files_url || '', 'icechunk/flatbuffers') || github.event_name == 'push'
 
     steps:
       - uses: actions/checkout@v4

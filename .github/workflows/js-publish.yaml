@@ -1,8 +1,11 @@
 name: JS Publish to npm
 
 on:
-  release:
-    types: [published]
+  workflow_dispatch:
+  # Disabled: triggers on any monorepo release tag, not just JS releases.
+  # Re-enable with proper tag filtering (e.g., tags: ['js-v*']) when ready.
+  # release:
+  #   types: [published]
 
 defaults:
   run:
