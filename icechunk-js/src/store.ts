@@ -8,7 +8,8 @@
 import { Repository } from "./reader/repository.js";
 import { ReadSession } from "./reader/session.js";
 import { HttpStorage } from "./storage/http-storage.js";
-import type { Storage, TransformRequest } from "./storage/storage.js";
+import type { Storage, FetchClient } from "./storage/storage.js";
+import type { NodeSnapshot } from "./format/flatbuffers/types.js";
 
 /**
  * zarrita's AbsolutePath type - paths must start with "/"
@@ -52,14 +53,32 @@ export interface IcechunkStoreOptions {
   formatVersion?: "v1" | "v2";
 
   /**
-   * Callback to transform virtual chunk URLs before fetching.
+   * Pluggable HTTP client for virtual chunk fetching.
    *
    * Use this to:
    * - Generate pre-signed S3 URLs
    * - Add authentication headers
    * - Route through a proxy
    */
-  transformRequest?: TransformRequest;
+  fetchClient?: FetchClient;
+
+  /** Maximum number of manifests to cache in the LRU cache (default: 100) */
+  maxManifestCacheSize?: number;
+
+  /**
+   * Send If-Match / If-Unmodified-Since headers on virtual chunk requests.
+   *
+   * Defaults to false because these headers trigger CORS preflight in browsers.
+   */
+  validateChecksums?: boolean;
+
+  /**
+   * Azure storage account name for translating az:// and azure:// URLs.
+   *
+   * Required when virtual chunks reference az:// or azure:// URLs.
+   * Not needed for abfs:// URLs which embed the account in the host.
+   */
+  azureAccount?: string;
 }
 
 /**
@@ -79,12 +98,18 @@ export interface IcechunkStoreOptions {
  * ```
  */
 export class IcechunkStore implements AsyncReadable {
-  private session: ReadSession;
-  private transformRequest?: TransformRequest;
+  /** The underlying read session. Exposed for advanced usage. */
+  readonly session: ReadSession;
+  private fetchClient?: FetchClient;
+  private validateChecksums: boolean;
+  private azureAccount?: string;
+  private basePath: string = "";
 
   private constructor(
     session: ReadSession,
-    transformRequest?: TransformRequest,
+    fetchClient?: FetchClient,
+    validateChecksums?: boolean,
+    azureAccount?: string,
   ) {
     if (!(session instanceof ReadSession)) {
       throw new Error(
@@ -92,7 +117,9 @@ export class IcechunkStore implements AsyncReadable {
       );
     }
     this.session = session;
-    this.transformRequest = transformRequest;
+    this.fetchClient = fetchClient;
+    this.validateChecksums = validateChecksums ?? false;
+    this.azureAccount = azureAccount;
   }
 
   /**
@@ -110,11 +137,11 @@ export class IcechunkStore implements AsyncReadable {
    * Open an IcechunkStore from an existing ReadSession.
    *
    * @param session - Existing ReadSession
-   * @param options - Store options (only transformRequest is used)
+   * @param options - Store options (only fetchClient is used)
    */
   static async open(
     session: ReadSession,
-    options?: Pick<IcechunkStoreOptions, "transformRequest">,
+    options?: Pick<IcechunkStoreOptions, "fetchClient">,
   ): Promise<IcechunkStore>;
 
   /**
@@ -133,7 +160,12 @@ export class IcechunkStore implements AsyncReadable {
     options: IcechunkStoreOptions = {},
   ): Promise<IcechunkStore> {
     if (arg instanceof ReadSession) {
-      return new IcechunkStore(arg, options.transformRequest);
+      return new IcechunkStore(
+        arg,
+        options.fetchClient,
+        options.validateChecksums,
+        options.azureAccount,
+      );
     }
 
     const storage = typeof arg === "string" ? new HttpStorage(arg) : arg;
@@ -145,19 +177,30 @@ export class IcechunkStore implements AsyncReadable {
       requestOptions,
     );
 
+    // Build session options: merge request options with cache size
+    const sessionOptions = {
+      ...requestOptions,
+      maxManifestCacheSize: options.maxManifestCacheSize,
+    };
+
     let session: ReadSession;
     if (options.snapshot) {
-      session = await repo.checkoutSnapshot(options.snapshot, requestOptions);
+      session = await repo.checkoutSnapshot(options.snapshot, sessionOptions);
     } else if (options.tag) {
-      session = await repo.checkoutTag(options.tag, requestOptions);
+      session = await repo.checkoutTag(options.tag, sessionOptions);
     } else {
       session = await repo.checkoutBranch(
         options.branch ?? "main",
-        requestOptions,
+        sessionOptions,
       );
     }
 
-    return new IcechunkStore(session, options.transformRequest);
+    return new IcechunkStore(
+      session,
+      options.fetchClient,
+      options.validateChecksums,
+      options.azureAccount,
+    );
   }
 
   /**
@@ -179,16 +222,19 @@ export class IcechunkStore implements AsyncReadable {
     if (opts?.signal?.aborted) return undefined;
 
     const parsed = parseZarrKey(key);
+    const resolvedPath = this.resolvePath(parsed.path);
 
     try {
       if (parsed.type === "metadata") {
-        const data = this.session.getRawMetadata(parsed.path);
+        const data = this.session.getRawMetadata(resolvedPath);
         return data ?? undefined;
       }
 
-      const chunk = await this.session.getChunk(parsed.path, parsed.coords, {
+      const chunk = await this.session.getChunk(resolvedPath, parsed.coords, {
         signal: opts?.signal,
-        transformRequest: this.transformRequest,
+        ...(this.fetchClient && { fetchClient: this.fetchClient }),
+        validateChecksums: this.validateChecksums,
+        azureAccount: this.azureAccount,
       });
       return chunk ?? undefined;
     } catch {
@@ -216,24 +262,27 @@ export class IcechunkStore implements AsyncReadable {
     if (opts?.signal?.aborted) return undefined;
 
     const parsed = parseZarrKey(key);
+    const resolvedPath = this.resolvePath(parsed.path);
 
     try {
       if (parsed.type === "chunk") {
         // Use targeted byte-range read through the session
         const data = await this.session.getChunkRange(
-          parsed.path,
+          resolvedPath,
           parsed.coords,
           range,
           {
             signal: opts?.signal,
-            transformRequest: this.transformRequest,
+            ...(this.fetchClient && { fetchClient: this.fetchClient }),
+            validateChecksums: this.validateChecksums,
+            azureAccount: this.azureAccount,
           },
         );
         return data ?? undefined;
       }
 
       // For metadata keys, fetch full data and slice
-      const data = this.session.getRawMetadata(parsed.path);
+      const data = this.session.getRawMetadata(resolvedPath);
       if (!data) return undefined;
 
       if ("suffixLength" in range) {
@@ -243,6 +292,109 @@ export class IcechunkStore implements AsyncReadable {
     } catch {
       return undefined;
     }
+  }
+
+  /** Prepend basePath to a parsed path. */
+  private resolvePath(path: string): string {
+    if (!this.basePath) return path;
+    // path is "/" for root or "/group/array" for nested
+    if (path === "/") return `/${this.basePath}`;
+    return `/${this.basePath}${path}`;
+  }
+
+  /**
+   * Create a store scoped to a subpath.
+   *
+   * The returned store shares the same session (and manifest cache)
+   * but prepends `path` to all key lookups. This matches zarrita's
+   * `root(store).resolve(path)` pattern.
+   *
+   * @param path - Subpath to scope to (e.g., "group/array")
+   * @returns A new IcechunkStore scoped to the subpath
+   */
+  resolve(path: string): IcechunkStore {
+    const scoped = new IcechunkStore(
+      this.session,
+      this.fetchClient,
+      this.validateChecksums,
+      this.azureAccount,
+    );
+    const cleanPath = path.replace(/^\/+|\/+$/g, "");
+    scoped.basePath = this.basePath
+      ? `${this.basePath}/${cleanPath}`
+      : cleanPath;
+    return scoped;
+  }
+
+  /**
+   * List direct children of a group by name.
+   *
+   * @param parentPath - Path to the parent group (use "/" for root).
+   *                     When omitted, uses the store's base path (or root).
+   * @returns Array of child names (e.g., ["temperature", "precipitation"])
+   */
+  listChildren(parentPath?: string): string[] {
+    let path: string;
+    if (parentPath == null) {
+      path = this.basePath ? `/${this.basePath}` : "/";
+    } else if (this.basePath) {
+      path =
+        `/${this.basePath}/${parentPath.replace(/^\//, "")}`
+          .replace(/\/+/g, "/")
+          .replace(/\/+$/, "") || "/";
+    } else {
+      // Normalize: ensure leading slash, strip trailing slashes
+      path =
+        (parentPath.startsWith("/") ? parentPath : `/${parentPath}`).replace(
+          /\/+$/,
+          "",
+        ) || "/";
+    }
+    const nodes = this.session.listChildren(path);
+    return nodes.map((node) => {
+      // Extract the last path segment as the child name
+      const segments = node.path.split("/");
+      return segments[segments.length - 1];
+    });
+  }
+
+  /**
+   * List all nodes in the snapshot.
+   *
+   * @returns Array of all nodes
+   */
+  listNodes(): NodeSnapshot[] {
+    return this.session.listNodes();
+  }
+
+  /**
+   * Get a node by path.
+   *
+   * @param path - Absolute path (e.g., "/array" or "/group/nested")
+   * @returns NodeSnapshot or null if not found
+   */
+  getNode(path: string): NodeSnapshot | null {
+    const fullPath =
+      (this.basePath
+        ? `/${this.basePath}/${path.replace(/^\//, "")}`.replace(/\/+/g, "/")
+        : path
+      ).replace(/\/+$/, "") || "/";
+    return this.session.getNode(fullPath);
+  }
+
+  /**
+   * Get parsed Zarr metadata for a node.
+   *
+   * @param path - Path to the node
+   * @returns Parsed JSON metadata or null if node not found
+   */
+  getMetadata(path: string): unknown | null {
+    const fullPath =
+      (this.basePath
+        ? `/${this.basePath}/${path.replace(/^\//, "")}`.replace(/\/+/g, "/")
+        : path
+      ).replace(/\/+$/, "") || "/";
+    return this.session.getMetadata(fullPath);
   }
 }
 

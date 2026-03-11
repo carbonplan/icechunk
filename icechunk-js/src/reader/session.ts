@@ -5,6 +5,7 @@
 import type { Storage, ByteRange, RequestOptions } from "../storage/storage.js";
 import { AbortError } from "../storage/storage.js";
 import { decompress } from "fzstd";
+import { LRUCache } from "../cache/lru.js";
 import {
   parseHeader,
   validateFileType,
@@ -17,11 +18,13 @@ import {
   getSnapshotPath,
   getManifestPath,
   getChunkPath,
+  getTransactionLogPath,
 } from "../format/constants.js";
 import { encodeObjectId12 } from "../format/object-id.js";
 import {
   parseSnapshot,
   parseManifest,
+  parseTransactionLog,
   findChunkRef,
   getChunkPayload,
   deserializeMetadata,
@@ -30,7 +33,9 @@ import {
   type NodeSnapshot,
   type ChunkPayload,
   type ObjectId12,
+  type TransactionLogEntry,
 } from "../format/flatbuffers/index.js";
+import { NotFoundError } from "../storage/storage.js";
 
 /**
  * ReadSession provides read access to a specific snapshot.
@@ -44,16 +49,18 @@ export class ReadSession {
   private storage: Storage;
   private snapshot: Snapshot;
   private specVersion: SpecVersion;
-  private manifestCache: Map<string, Manifest> = new Map();
+  private manifestCache: LRUCache<string, Manifest>;
 
   private constructor(
     storage: Storage,
     snapshot: Snapshot,
     specVersion: SpecVersion,
+    maxManifestCacheSize: number = 100,
   ) {
     this.storage = storage;
     this.snapshot = snapshot;
     this.specVersion = specVersion;
+    this.manifestCache = new LRUCache(maxManifestCacheSize);
   }
 
   /**
@@ -67,14 +74,19 @@ export class ReadSession {
   static async open(
     storage: Storage,
     snapshotId: Uint8Array,
-    options?: RequestOptions,
+    options?: RequestOptions & { maxManifestCacheSize?: number },
   ): Promise<ReadSession> {
     const { snapshot, specVersion } = await ReadSession.loadSnapshot(
       storage,
       snapshotId,
       options,
     );
-    return new ReadSession(storage, snapshot, specVersion);
+    return new ReadSession(
+      storage,
+      snapshot,
+      specVersion,
+      options?.maxManifestCacheSize,
+    );
   }
 
   /** Load and parse a snapshot from storage */
@@ -152,6 +164,13 @@ export class ReadSession {
   }
 
   /**
+   * Get the parent snapshot ID, or null for root snapshots.
+   */
+  getParentSnapshotId(): ObjectId12 | null {
+    return this.snapshot.parentId;
+  }
+
+  /**
    * Get the commit message for this snapshot.
    */
   getMessage(): string {
@@ -174,6 +193,38 @@ export class ReadSession {
    */
   getSnapshotMetadata(): Record<string, unknown> {
     return deserializeMetadata(this.snapshot.metadata, this.specVersion);
+  }
+
+  /**
+   * Load and parse the transaction log for this snapshot.
+   *
+   * Returns null if no transaction log exists (e.g., root snapshot).
+   *
+   * @param options - Optional request options (signal for cancellation)
+   * @returns Parsed transaction log entry or null
+   */
+  async loadTransactionLog(
+    options?: RequestOptions,
+  ): Promise<TransactionLogEntry | null> {
+    const path = getTransactionLogPath(encodeObjectId12(this.snapshot.id));
+
+    let data: Uint8Array;
+    try {
+      data = await this.storage.getObject(path, undefined, options);
+    } catch (error) {
+      if (error instanceof NotFoundError) return null;
+      throw error;
+    }
+
+    const header = parseHeader(data);
+    validateFileType(header, FileType.TransactionLog);
+
+    let flatbufferData = getDataAfterHeader(data);
+    if (header.compression === CompressionAlgorithm.Zstd) {
+      flatbufferData = decompress(flatbufferData);
+    }
+
+    return parseTransactionLog(flatbufferData);
   }
 
   /**
@@ -392,40 +443,50 @@ export class ReadSession {
       case "virtual": {
         // Virtual chunks reference external URLs
         // Translate cloud storage URLs to HTTPS endpoints
-        let httpUrl = translateToHttpUrl(payload.location);
-        let fetchInit: RequestInit = {
-          headers: {
-            Range: `bytes=${payload.offset}-${payload.offset + payload.length - 1}`,
-          },
+        const httpUrl = translateToHttpUrl(
+          payload.location,
+          options?.azureAccount,
+        );
+        const headers: Record<string, string> = {
+          Range: `bytes=${payload.offset}-${payload.offset + payload.length - 1}`,
+        };
+
+        // Add conditional request headers for integrity validation (opt-in
+        // because these trigger CORS preflight in browsers)
+        if (options?.validateChecksums) {
+          if (payload.checksumEtag) {
+            headers["If-Match"] = payload.checksumEtag;
+          }
+          if (payload.checksumLastModified > 0) {
+            headers["If-Unmodified-Since"] = new Date(
+              payload.checksumLastModified * 1000,
+            ).toUTCString();
+          }
+        }
+
+        const fetchInit: RequestInit = {
+          headers,
           signal: options?.signal,
         };
 
-        // If transformRequest provided, let it override URL and add options
-        if (options?.transformRequest) {
-          const result = await options.transformRequest(httpUrl, {
-            method: "GET",
-          });
-          httpUrl = result.url;
-          if (result.headers) {
-            fetchInit.headers = { ...fetchInit.headers, ...result.headers };
-          }
-          // Note: method override is intentionally ignored for virtual chunk fetches.
-          // HEAD requests would return empty body, silently corrupting chunk data.
-          // The method in TransformRequestOptions is informational only (for signed URL generation).
-          // Merge other RequestInit options (excluding url, headers, method)
-          const { url: _, headers: __, method: ___, ...rest } = result;
-          fetchInit = { ...fetchInit, ...rest };
-        }
-
         let response: Response;
         try {
-          response = await fetch(httpUrl, fetchInit);
+          const client = options?.fetchClient;
+          response = client
+            ? await client.fetch(httpUrl, fetchInit)
+            : await fetch(httpUrl, fetchInit);
         } catch (error) {
           // Translate abort errors to our class (handles DOMException and other implementations)
           if (error instanceof Error && error.name === "AbortError") {
             throw new AbortError();
           }
           throw error;
+        }
+
+        if (response.status === 412) {
+          throw new Error(
+            `Virtual chunk at ${httpUrl} failed integrity check — data has been modified since snapshot was created`,
+          );
         }
 
         if (response.status !== 200 && response.status !== 206) {
@@ -469,10 +530,12 @@ export class ReadSession {
     let rangeEnd: number;
 
     if ("suffixLength" in range) {
-      rangeStart = payload.type === "inline"
-        ? payload.data.length - range.suffixLength
-        : payload.length - range.suffixLength;
-      rangeEnd = payload.type === "inline" ? payload.data.length : payload.length;
+      rangeStart =
+        payload.type === "inline"
+          ? payload.data.length - range.suffixLength
+          : payload.length - range.suffixLength;
+      rangeEnd =
+        payload.type === "inline" ? payload.data.length : payload.length;
     } else {
       rangeStart = range.offset;
       rangeEnd = range.offset + range.length;
@@ -507,34 +570,49 @@ export class ReadSession {
         const absoluteStart = payload.offset + rangeStart;
         const absoluteEnd = payload.offset + rangeEnd;
 
-        let httpUrl = translateToHttpUrl(payload.location);
-        let fetchInit: RequestInit = {
-          headers: {
-            Range: `bytes=${absoluteStart}-${absoluteEnd - 1}`,
-          },
+        const httpUrl = translateToHttpUrl(
+          payload.location,
+          options?.azureAccount,
+        );
+        const headers: Record<string, string> = {
+          Range: `bytes=${absoluteStart}-${absoluteEnd - 1}`,
+        };
+
+        // Add conditional request headers for integrity validation (opt-in
+        // because these trigger CORS preflight in browsers)
+        if (options?.validateChecksums) {
+          if (payload.checksumEtag) {
+            headers["If-Match"] = payload.checksumEtag;
+          }
+          if (payload.checksumLastModified > 0) {
+            headers["If-Unmodified-Since"] = new Date(
+              payload.checksumLastModified * 1000,
+            ).toUTCString();
+          }
+        }
+
+        const fetchInit: RequestInit = {
+          headers,
           signal: options?.signal,
         };
 
-        if (options?.transformRequest) {
-          const result = await options.transformRequest(httpUrl, {
-            method: "GET",
-          });
-          httpUrl = result.url;
-          if (result.headers) {
-            fetchInit.headers = { ...fetchInit.headers, ...result.headers };
-          }
-          const { url: _, headers: __, method: ___, ...rest } = result;
-          fetchInit = { ...fetchInit, ...rest };
-        }
-
         let response: Response;
         try {
-          response = await fetch(httpUrl, fetchInit);
+          const client = options?.fetchClient;
+          response = client
+            ? await client.fetch(httpUrl, fetchInit)
+            : await fetch(httpUrl, fetchInit);
         } catch (error) {
           if (error instanceof Error && error.name === "AbortError") {
             throw new AbortError();
           }
           throw error;
+        }
+
+        if (response.status === 412) {
+          throw new Error(
+            `Virtual chunk at ${httpUrl} failed integrity check — data has been modified since snapshot was created`,
+          );
         }
 
         if (response.status !== 200 && response.status !== 206) {
@@ -621,17 +699,19 @@ function compareUtf8Bytes(a: string, b: string): number {
  * Supports:
  * - s3://bucket/key → https://bucket.s3.amazonaws.com/key (or path-style for dotted buckets)
  * - gs://bucket/key or gcs://bucket/key → https://storage.googleapis.com/bucket/key
+ * - az://container/path or azure://container/path → https://{azureAccount}.blob.core.windows.net/container/path
+ * - abfs://container@account.dfs.core.windows.net/path → https://account.blob.core.windows.net/container/path
  * - http(s):// URLs pass through unchanged
  *
- * NOT supported (passed through unchanged, will fail):
- * - az:// (Azure) - requires storage account name which is not in the URL
- * - Private buckets - require credentials or pre-signed URLs
+ * Azure az:// and azure:// URLs follow the Rust convention where the host is
+ * the container name (not the account). The account must be supplied separately
+ * via the azureAccount parameter.
  *
  * Note: S3 URLs use virtual-hosted style for simple bucket names, but fall back to
  * path-style for buckets containing dots (which break SSL certificate validation).
  * For buckets in specific regions, S3 will redirect to the correct endpoint.
  */
-function translateToHttpUrl(url: string): string {
+function translateToHttpUrl(url: string, azureAccount?: string): string {
   // S3: s3://bucket/key → https://bucket.s3.amazonaws.com/key
   // For buckets with dots, use path-style: https://s3.amazonaws.com/bucket/key
   if (url.startsWith("s3://")) {
@@ -661,9 +741,49 @@ function translateToHttpUrl(url: string): string {
     return `https://storage.googleapis.com/${rest}`;
   }
 
-  // Azure (az://, azure://, abfs://) - cannot translate without storage account name
-  // Pass through unchanged - will fail with clear error message
-  // Use Python/Rust SDK for Azure virtual refs, or pre-signed URLs
+  // Azure: az://container/path or azure://container/path
+  // → https://{azureAccount}.blob.core.windows.net/container/path
+  // Matches Rust convention: container is in the host position, account from config.
+  if (url.startsWith("az://") || url.startsWith("azure://")) {
+    if (!azureAccount) {
+      throw new Error(
+        `Cannot translate Azure URL "${url}": azureAccount option is required. ` +
+          `az:// and azure:// URLs encode only the container name; ` +
+          `pass azureAccount in store options to supply the storage account.`,
+      );
+    }
+    const prefixLen = url.startsWith("az://") ? 5 : 8;
+    const rest = url.slice(prefixLen);
+    const firstSlash = rest.indexOf("/");
+    if (firstSlash === -1) {
+      // Just container, no path
+      return `https://${azureAccount}.blob.core.windows.net/${rest}`;
+    }
+    const container = rest.slice(0, firstSlash);
+    const path = rest.slice(firstSlash + 1);
+    return `https://${azureAccount}.blob.core.windows.net/${container}/${path}`;
+  }
+
+  // ABFS: abfs://container@account.dfs.core.windows.net/path
+  // → https://account.blob.core.windows.net/container/path
+  if (url.startsWith("abfs://")) {
+    const rest = url.slice(7); // Remove 'abfs://'
+    const atIndex = rest.indexOf("@");
+    if (atIndex !== -1) {
+      const container = rest.slice(0, atIndex);
+      const hostAndPath = rest.slice(atIndex + 1);
+      // Extract account from account.dfs.core.windows.net/path
+      const firstSlash = hostAndPath.indexOf("/");
+      const host =
+        firstSlash === -1 ? hostAndPath : hostAndPath.slice(0, firstSlash);
+      const path = firstSlash === -1 ? "" : hostAndPath.slice(firstSlash + 1);
+      // Extract account name from host (account.dfs.core.windows.net)
+      const dotIndex = host.indexOf(".");
+      const account = dotIndex === -1 ? host : host.slice(0, dotIndex);
+      const suffix = path ? `${container}/${path}` : container;
+      return `https://${account}.blob.core.windows.net/${suffix}`;
+    }
+  }
 
   // Already HTTP(S) or unsupported scheme - pass through
   return url;

@@ -11,47 +11,56 @@ export interface ByteRange {
   end: number;
 }
 
-/** Options passed to the transformRequest callback */
-export interface TransformRequestOptions {
-  /** HTTP method for the request */
-  method?: "GET" | "HEAD";
-}
-
-/** Result returned by the transformRequest callback */
-export interface TransformRequestResult {
-  /** The (possibly transformed) URL to fetch */
-  url: string;
-  /** Additional headers to include in the request */
-  headers?: Record<string, string>;
-  /** HTTP method to use (defaults to GET) */
-  method?: "GET" | "HEAD";
-  /** Allow other RequestInit options to be passed through */
-  [key: string]: unknown;
-}
-
 /**
- * Callback to transform virtual chunk URLs before fetching.
+ * Pluggable HTTP client for virtual chunk fetching.
  *
  * Use this to:
  * - Generate pre-signed S3 URLs
  * - Add authentication headers
  * - Route through a proxy
  *
- * @param url - The URL after default translation (e.g., s3:// → https://)
- * @param options - Request options including HTTP method
- * @returns Transformed URL and optional headers/RequestInit options
+ * icechunk-js handles URL translation (s3:// → https://) and builds
+ * all headers (Range, If-Match, etc.) before calling fetch().
+ * The client only needs to execute the HTTP request.
  */
-export type TransformRequest = (
-  url: string,
-  options?: TransformRequestOptions,
-) => TransformRequestResult | Promise<TransformRequestResult>;
+export interface FetchClient {
+  fetch(url: string, init?: RequestInit): Promise<Response>;
+}
+
+/** Default FetchClient that delegates to globalThis.fetch. */
+export class DefaultFetchClient implements FetchClient {
+  fetch(url: string, init?: RequestInit): Promise<Response> {
+    return globalThis.fetch(url, init);
+  }
+}
 
 /** Options for storage request operations */
 export interface RequestOptions {
   /** AbortSignal for request cancellation */
   signal?: AbortSignal;
-  /** Callback to transform virtual chunk URLs before fetching */
-  transformRequest?: TransformRequest;
+  /** Pluggable HTTP client for virtual chunk fetching */
+  fetchClient?: FetchClient;
+  /**
+   * Send If-Match / If-Unmodified-Since headers on virtual chunk requests.
+   *
+   * When true, the storage server will return 412 Precondition Failed if
+   * the underlying file has changed since the snapshot recorded its checksum.
+   *
+   * Defaults to false because these headers trigger CORS preflight requests
+   * in browsers, and most storage servers don't whitelist them by default.
+   */
+  validateChecksums?: boolean;
+  /**
+   * Azure storage account name for translating az:// and azure:// URLs.
+   *
+   * Required when virtual chunks reference az:// or azure:// URLs, since
+   * these schemes encode only the container name (e.g., az://container/path).
+   * The account is needed to build the HTTPS endpoint:
+   * https://{account}.blob.core.windows.net/{container}/{path}
+   *
+   * Not needed for abfs:// URLs, which embed the account in the host.
+   */
+  azureAccount?: string;
 }
 
 /** Error thrown when an object is not found */

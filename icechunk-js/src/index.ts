@@ -36,11 +36,13 @@ export type {
   Storage,
   ByteRange,
   RequestOptions,
-  TransformRequest,
-  TransformRequestOptions,
-  TransformRequestResult,
+  FetchClient,
 } from "./storage/storage.js";
-export { NotFoundError, StorageError } from "./storage/storage.js";
+export {
+  NotFoundError,
+  StorageError,
+  DefaultFetchClient,
+} from "./storage/storage.js";
 
 // Format types (for advanced usage)
 export type {
@@ -63,7 +65,14 @@ export type {
   MetadataItem,
   ObjectId12,
   ObjectId8,
+  TransactionLogEntry,
+  ArrayUpdatedChunksInfo,
+  UpdatedChunkIndices,
+  MoveOperationInfo,
 } from "./format/flatbuffers/types.js";
+
+// Cache utilities
+export { LRUCache } from "./cache/lru.js";
 
 // Format utilities
 export {
